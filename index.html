@@ -1,0 +1,528 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Session Board</title>
+<style>
+  :root{
+    /* neutral scale (Radix slate dark) — bulk of the UI, high-contrast + readable */
+    --bg:#111113; --panel:#17181a; --panel2:#202124; --line:#282a2e; --line2:#383b40;
+    --fg:#edeef0; --dim:#b0b4ba; --dim2:#7e848d;
+    /* signal colors — used sparingly, only for things that should catch the eye */
+    --p1:#e5555b; --p2:#c99a3f; --p3:#7e848d;
+    --busy:#e0a33a; --idle:#4cc38a; --acc:#7cb0ff;
+    --warn:#e0a33a; --push:#c99a3f; --ok:#4cc38a;
+    --need:#ff6b73;  /* "waiting" = blocked on you: the loudest live signal */
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:13.5px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  header{position:sticky;top:0;z-index:5;background:rgba(13,16,23,.82);backdrop-filter:blur(10px);
+    border-bottom:1px solid var(--line);padding:10px 16px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+  header h1{font-size:15px;margin:0;font-weight:650;letter-spacing:.2px}
+  header h1 .k{color:var(--acc)}
+  .stat{color:var(--dim);font-size:12px}
+  .stat b{color:var(--fg)}
+  .idot{display:inline-block;width:7px;height:7px;border-radius:50%;vertical-align:middle;margin-right:2px}
+  .idot.busy{background:var(--busy)} .idot.idle{background:var(--idle)} .idot.waiting{background:var(--need)}
+  .search{display:flex;align-items:center;gap:9px;background:var(--panel2);border:1px solid var(--line2);
+    border-radius:9px;padding:7px 13px;flex:1;min-width:260px;max-width:460px;margin-left:auto}
+  .search:focus-within{border-color:var(--acc)}
+  .search .si{color:var(--dim);flex:none}
+  .search input{background:none;border:none;color:var(--fg);outline:none;width:100%;font-size:14px}
+  .search input::placeholder{color:var(--dim2)}
+  .search kbd{color:var(--dim2);font-size:11px;border:1px solid var(--line2);border-radius:4px;padding:0 4px;flex:none}
+  button{font:inherit;color:var(--fg);background:var(--panel2);border:1px solid var(--line2);
+    border-radius:7px;padding:4px 9px;cursor:pointer}
+  button:hover{border-color:var(--acc)}
+  button.ghost{background:none;border-color:transparent;color:var(--dim);padding:2px 6px}
+  button.ghost:hover{color:var(--fg);border-color:var(--line2)}
+  /* two equal columns (50-50) */
+  main{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;padding:14px 16px;align-items:start}
+  @media(max-width:900px){main{grid-template-columns:1fr}}
+  .col>h2{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim);
+    margin:0 0 8px;display:flex;gap:8px;align-items:center}
+  /* shared top bar for both columns: filters on the left, sort pushed right.
+     row1 = primary filter (status / tabs) + sort; row2 = priority filter, sitting just below */
+  .controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;min-height:28px}
+  .controls.row1{margin-bottom:8px}
+  .controls .grow{flex:1}
+  .rowlabel{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim2)}
+  /* keep History compact/secondary — it scrolls within a bounded height instead of towering over Active */
+  .col-history #history{max-height:78vh;overflow-y:auto;padding-right:6px;
+    scrollbar-width:thin;scrollbar-color:var(--line2) transparent}   /* thin themed scrollbar (Firefox) */
+  .col-history #history::-webkit-scrollbar{width:8px}
+  .col-history #history::-webkit-scrollbar-track{background:transparent}
+  .col-history #history::-webkit-scrollbar-thumb{background:var(--line2);border-radius:8px;border:2px solid transparent;background-clip:padding-box}
+  .col-history #history:hover::-webkit-scrollbar-thumb{background:var(--dim2);background-clip:padding-box}
+  /* ONE shared filter-pill look — status (busy/idle/waiting), priority (H/M/L) and history tabs all
+     read identically, so "active = blue border + bold + tint" is unmistakable and consistent everywhere.
+     No per-filter colour highlights: the ONLY visual difference is on/off, so activeness is obvious. */
+  .sfset,.pfset,.tabs{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}
+  .tab,.pf,.sf{font-size:12px;padding:3px 10px;border-radius:20px;background:var(--panel2);
+    border:1px solid var(--line2);color:var(--dim);cursor:pointer;
+    display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+  .tab:hover,.pf:hover,.sf:hover{color:var(--fg);border-color:var(--dim2)}
+  .tab.on,.pf.on,.sf.on{color:var(--fg);font-weight:600;border-color:var(--acc);background:#7cb0ff1f}
+  .tab .n{color:var(--dim2);margin-left:2px}
+  .tab.on .n{color:var(--dim)}
+  select{background:var(--panel2);color:var(--fg);border:1px solid var(--line2);border-radius:7px;padding:3px 6px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:9px 11px;margin-bottom:8px;transition:border-color .15s}
+  .card:hover{border-color:#7cb0ff33}
+  /* a session blocked on you gets a loud left rail so it's impossible to miss */
+  .card.need{border-color:#ff6b7355;border-left:3px solid var(--need);background:#ff6b730d}
+  .row{display:flex;gap:9px;align-items:flex-start}
+  .dot{width:9px;height:9px;border-radius:50%;margin-top:5px;flex:none;background:var(--dim2)}
+  .dot.busy{background:var(--busy);box-shadow:0 0 0 0 var(--busy);animation:pulse 1.4s infinite}
+  .dot.idle{background:var(--idle)}
+  .dot.waiting{background:var(--need);box-shadow:0 0 0 0 var(--need);animation:pulseNeed 1.15s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 #e0a33a88}70%{box-shadow:0 0 0 6px #e0a33a00}100%{box-shadow:0 0 0 0 #e0a33a00}}
+  @keyframes pulseNeed{0%{box-shadow:0 0 0 0 #ff6b73aa}70%{box-shadow:0 0 0 7px #ff6b7300}100%{box-shadow:0 0 0 0 #ff6b7300}}
+  .badge.need{color:#ffb0b4;border-color:#ff6b7366;background:#ff6b7322;font-weight:600}
+  .title{font-weight:600;word-break:break-word}
+  .aka{font-size:11px;color:var(--dim2);margin-top:1px;word-break:break-word;font-style:italic}
+  .aka b{font-style:normal;font-weight:600;opacity:.8}
+  .sub{color:var(--dim);font-size:12px;margin-top:2px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  /* base badge: neutral & quiet — the default for anything non-urgent */
+  .badge{font-size:11px;padding:1px 8px;border-radius:20px;border:1px solid var(--line2);color:var(--dim);background:transparent}
+  .badge.proj{color:var(--dim);border-color:var(--line2);background:transparent}
+  /* uncommitted work is THE signal — amber fill, meant to catch the eye */
+  .badge.dirty{color:#e7bd6f;border-color:#e0a33a59;background:#e0a33a1f;font-weight:600}
+  /* unpushed is secondary — gold text, no fill */
+  .badge.push{color:var(--push);border-color:#c99a3f3d;background:transparent}
+  /* live is reassuring, not urgent — muted green outline */
+  .badge.live{color:var(--ok);border-color:#4cc38a3d;background:transparent}
+  .badge.prio{font-weight:600}
+  /* High shouts (red fill); Medium is a mild gold; Low is plain gray */
+  .p1{color:#ff9ea3!important;border-color:#e5555b66!important;background:#e5555b26!important}
+  .p2{color:#d1a24a!important;border-color:#c99a3f4d!important;background:transparent!important}
+  .p3{color:var(--dim2)!important;border-color:var(--line2)!important;background:transparent!important}
+  .prio-set{display:flex;gap:4px;margin-left:auto}
+  .prio-set button{padding:1px 9px;font-size:11px;border-radius:20px;line-height:1.5;color:var(--dim)}
+  .prio-set button.act1{background:#e5555b26;border-color:#e5555b80;color:#ff9ea3}
+  .prio-set button.act2{background:transparent;border-color:#c99a3f80;color:#d1a24a}
+  .prio-set button.act3{background:#8a919c26;border-color:var(--dim2);color:var(--fg);font-weight:600}
+  .chk{flex:none;margin-top:2px;cursor:pointer;font-size:15px;color:var(--dim2);background:none;border:none;padding:0}
+  .chk.on{color:var(--ok)}
+  .note{width:100%;margin-top:6px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;
+    color:var(--dim);padding:4px 7px;font-size:12px;resize:vertical;min-height:26px;display:none}
+  .note.show{display:block}
+  .acts{display:flex;gap:5px;margin-left:auto}
+  .empty{color:var(--dim2);padding:20px;text-align:center;border:1px dashed var(--line2);border-radius:10px}
+  .bulk{margin:2px 0 10px}
+  .toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--panel2);
+    border:1px solid var(--line2);border-radius:8px;padding:8px 14px;opacity:0;transition:.25s;pointer-events:none}
+  .toast.show{opacity:1}
+  .modal-ov{position:fixed;inset:0;background:#000a;display:flex;align-items:center;justify-content:center;z-index:60;
+    opacity:0;transition:opacity .12s}
+  .modal-ov.show{opacity:1}
+  .modal{background:var(--panel2);border:1px solid var(--line2);border-radius:12px;padding:18px 20px;max-width:340px;
+    box-shadow:0 12px 40px #000b}
+  .modal-msg{color:var(--fg);font-size:14px;line-height:1.5;margin-bottom:16px}
+  .modal-acts{display:flex;gap:8px;justify-content:flex-end}
+  .btn-danger{background:#e5555b26;border-color:#e5555b80;color:#ff9ea3}
+  .btn-danger:hover{background:#e5555b3a;border-color:#e5555b}
+  .modal.help{max-width:520px;text-align:left;max-height:80vh;overflow:auto}
+  .modal.help h3{font-size:15px;margin:0 0 4px}
+  .help-sec{margin-bottom:13px}
+  .help-sec:last-of-type{margin-bottom:4px}
+  .help-sec b{display:block;color:var(--fg);font-size:12.5px;letter-spacing:.02em;margin-bottom:2px}
+  .help-sec p{margin:0;color:var(--dim);font-size:12.5px;line-height:1.5}
+  .help-sec code{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:11.5px}
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="k">◧</span> Claude Session Board</h1>
+  <span class="stat" id="livestat">…</span>
+  <label class="search">
+    <svg class="si" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+    <input id="q" placeholder="Search titles & conversation text…" autocomplete="off">
+    <kbd>Ctrl K</kbd>
+  </label>
+  <button class="ghost" id="rescan" title="Re-index transcripts">↻ rescan</button>
+  <button class="ghost" id="help" title="How this board works">?</button>
+</header>
+
+<main>
+  <section class="col col-active">
+    <h2>Active</h2>
+    <div class="controls row1">
+      <span class="sfset" id="activestat"></span>
+      <span class="grow"></span>
+      <select id="activesort" title="Sort order">
+        <option value="priority" selected>Sort: priority</option>
+        <option value="status">Sort: status</option>
+        <option value="recent">Sort: last update</option>
+        <option value="idle">Sort: longest idle</option>
+      </select>
+    </div>
+    <div class="controls row2">
+      <span class="rowlabel">Priority</span>
+      <span id="activeprio"></span>
+    </div>
+    <div id="active"></div>
+  </section>
+
+  <section class="col col-history">
+    <h2>History <span class="stat" id="histstat"></span></h2>
+    <div class="controls row1">
+      <span class="tabs" id="tabs"></span>
+      <span class="grow"></span>
+      <select id="sort" title="Sort order">
+        <option value="recent">Sort: last message</option>
+        <option value="updated">Sort: last update</option>
+        <option value="oldest">Sort: oldest message</option>
+        <option value="priority">Sort: priority</option>
+      </select>
+      <button id="bulk" class="ghost">✓ Resolve all shown</button>
+    </div>
+    <div class="controls row2">
+      <span class="rowlabel">Priority</span>
+      <span id="histprio"></span>
+      <span class="grow"></span>
+      <button class="sf" id="histactive" title="Currently-live sessions are shown in the Active column; off by default they're hidden here to avoid duplication">include active</button>
+    </div>
+    <div id="history"></div>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+const TOKEN = "__CSB_TOKEN__";
+const H = {headers:{"X-Board-Token":TOKEN}};
+let STATE = {filter:"attention", sort:"recent", searching:false, lastFiltered:[], activeFilter:null, activeSort:"priority", activePrio:null, histPrio:null, histActive:false};
+
+// ---- tiny DOM helper (all dynamic text goes through textContent) ----
+function el(tag, props={}, ...kids){
+  const n=document.createElement(tag);
+  for(const [k,v] of Object.entries(props)){
+    if(k==="class") n.className=v;
+    else if(k==="text") n.textContent=v;                 // safe: text node, never HTML
+    else if(k.startsWith("on")) n.addEventListener(k.slice(2),v);
+    else if(v!==null&&v!==undefined) n.setAttribute(k,v);
+  }
+  for(const kd of kids){ if(kd) n.append(kd); }
+  return n;
+}
+async function api(path, opts){ const r=await fetch(path,{...H,...opts}); return r.json(); }
+async function post(path, body){
+  return api(path,{method:"POST",headers:{...H.headers,"Content-Type":"application/json"},body:JSON.stringify(body)});
+}
+function toast(msg){ const t=document.getElementById("toast"); t.textContent=msg; t.classList.add("show");
+  clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove("show"),1600); }
+// Custom in-page confirm (native confirm() freezes browser automation). Resolves true on Yes, false otherwise.
+function confirmDialog(msg, yesLabel="Yes"){
+  return new Promise(resolve=>{
+    let done=false;
+    const finish=(v)=>{ if(done) return; done=true; document.removeEventListener("keydown",onKey);
+      ov.classList.remove("show"); setTimeout(()=>ov.remove(),120); resolve(v); };
+    const yes=el("button",{class:"btn-danger",text:yesLabel,onclick:()=>finish(true)});
+    const no=el("button",{class:"ghost",text:"No",onclick:()=>finish(false)});
+    const ov=el("div",{class:"modal-ov",onclick:(e)=>{ if(e.target===ov) finish(false); }},
+      el("div",{class:"modal"}, el("div",{class:"modal-msg",text:msg}), el("div",{class:"modal-acts"}, no, yes)));
+    const onKey=(e)=>{ if(e.key==="Escape") finish(false); else if(e.key==="Enter") finish(true); };
+    document.addEventListener("keydown",onKey);
+    document.body.append(ov); requestAnimationFrame(()=>ov.classList.add("show")); yes.focus();
+  });
+}
+// The board's non-obvious, baked-in behaviours — surfaced so they aren't a mystery.
+const HELP_SECTIONS=[
+  ["Refreshing", el("p",{},"The Active list polls every 10s. Each poll re-reads live sessions' transcripts, so a new or renamed session shows its real Claude Code title within a refresh (throttled to ~20s per session, since a busy transcript can be 100+ MB). ", el("code",{text:"↻ rescan"}), " does a full re-index of all history.")],
+  ["Titles & “aka”", el("p",{},"A card shows the session's current title. Claude Code regenerates that title as the topic shifts — when it changes, the previous name is kept as the italic ", el("i",{text:"aka"})," line under the title, and stays searchable.")],
+  ["Sorting", el("p",{},"Every sort except ", el("i",{text:"last update"})," breaks ties by last update, most-recent first. In the Active list, a session with ", el("b",{style:"display:inline",text:"no priority set sorts the same as High"}),"  — an untriaged live session is treated as important until you say otherwise.")],
+  ["Priority", el("p",{},"①High ②Medium ③Low, set by hand on each card; blank counts as High for sorting only. Priorities you set are never changed by triage.")],
+  ["Triage (open vs resolved)", el("p",{},"Open/resolved is decided by read-only AI judges reading a sanitized digest of each session. Transcript text is treated as untrusted data (guards against prompt injection), the pass is non-destructive, and your manual notes and priorities are preserved. When unsure it leaves a session open.")],
+  ["Defaults", el("p",{},"Active sorts by priority; History sorts by last message and ", el("b",{style:"display:inline",text:"hides currently-live sessions by default"}),' — they\'re already in the Active column, so flip "include active" to also list them here. Everything stays on ', el("code",{text:"127.0.0.1"})," and never writes into ", el("code",{text:"~/.claude"}),".")],
+];
+function helpDialog(){
+  const close=()=>{ document.removeEventListener("keydown",onKey); ov.classList.remove("show"); setTimeout(()=>ov.remove(),120); };
+  const onKey=(e)=>{ if(e.key==="Escape") close(); };
+  const body=HELP_SECTIONS.map(([h,p])=>el("div",{class:"help-sec"}, el("b",{text:h}), p));
+  const ov=el("div",{class:"modal-ov",onclick:(e)=>{ if(e.target===ov) close(); }},
+    el("div",{class:"modal help"},
+      el("h3",{text:"How this board works"}),
+      ...body,
+      el("div",{class:"modal-acts"}, el("button",{class:"ghost",text:"Got it",onclick:close}))));
+  document.addEventListener("keydown",onKey);
+  document.body.append(ov); requestAnimationFrame(()=>ov.classList.add("show"));
+}
+
+function ago(ts){
+  if(!ts) return "";
+  const d=(Date.now()-Date.parse(ts.endsWith("Z")||ts.includes("+")?ts:ts+"Z"))/1000;
+  if(isNaN(d)) return "";
+  if(d<90) return "just now";
+  const m=d/60, h=m/60, dy=h/24;
+  if(m<60) return Math.round(m)+"m ago";
+  if(h<24) return Math.round(h)+"h ago";
+  if(dy<30) return Math.round(dy)+"d ago";
+  return Math.round(dy/30)+"mo ago";
+}
+// Absolute local timestamp, e.g. "11 Aug 2026, 18:51".
+function fmtAbs(ts){
+  if(!ts) return "";
+  const d=new Date(ts.endsWith("Z")||ts.includes("+")?ts:ts+"Z");
+  if(isNaN(d)) return "";
+  return d.toLocaleString(undefined,{day:"numeric",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"});
+}
+// Show recency by last real message; hover reveals the exact clock times (last message + last update if it differs).
+function agoCell(s){
+  const msg=s.last_msg||s.last_activity, upd=s.last_activity;
+  const sp=el("span",{text:ago(msg)});
+  const lines=[];
+  if(msg) lines.push("last message: "+fmtAbs(msg));
+  if(upd && upd!==msg) lines.push("last update: "+fmtAbs(upd));
+  if(lines.length) sp.title=lines.join("\n");
+  return sp;
+}
+// Live-session recency: newest of update / status-change; hover shows the exact clock times.
+function liveAgoCell(s){
+  const upd=s.updated_at||s.last_activity, ss=s.status_since, msg=s.last_msg;
+  const shown=upd||ss||msg;
+  if(!shown) return null;
+  const sp=el("span",{text:ago(shown)});
+  const lines=[];
+  if(upd) lines.push("updated: "+fmtAbs(upd));
+  if(ss && ss!==upd) lines.push((s.status||"status")+" since: "+fmtAbs(ss));
+  if(msg && msg!==upd && msg!==ss) lines.push("last message: "+fmtAbs(msg));
+  if(lines.length) sp.title=lines.join("\n");
+  return sp;
+}
+function gitBadges(g){
+  const out=[];
+  if(!g||!g.is_repo) return out;
+  if(g.dirty>0) out.push(el("span",{class:"badge dirty",text:"±"+g.dirty+" uncommitted"}));
+  if(g.ahead>0) out.push(el("span",{class:"badge push",text:"↑"+g.ahead+" unpushed"}));
+  return out;
+}
+function copyBtn(label, text){
+  return el("button",{class:"ghost",title:"Copy: "+text,onclick:()=>{navigator.clipboard.writeText(text);toast("copied");}},
+    document.createTextNode(label));
+}
+const PRIO={1:"High",2:"Medium",3:"Low"};
+const shq=s=>"'"+String(s).replace(/'/g,"'\\''")+"'";  // single-quote for the shell (handles spaces)
+function resumeCmd(s){
+  const r="claude --resume "+s.session_id;
+  return s.cwd ? "cd "+shq(s.cwd)+" && "+r : r;
+}
+// pencil glyph (top-right eraser → bottom-left tip). Trusted constant string, no user data → innerHTML is safe.
+const PENCIL='<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>';
+function pencilBtn(onclick){ const b=el("button",{class:"ghost",title:"note",onclick}); b.innerHTML=PENCIL; return b; }
+function prioSet(sid, cur){
+  const wrap=el("div",{class:"prio-set"});
+  [["High",1],["Medium",2],["Low",3]].forEach(([lbl,v])=>{
+    const b=el("button",{text:lbl,onclick:()=>setPrio(sid, cur===v?null:v)});
+    if(cur===v) b.classList.add("act"+v);
+    wrap.append(b);
+  });
+  const clr=el("button",{class:"ghost",text:"–",title:"clear priority",onclick:()=>setPrio(sid,null)});
+  wrap.append(clr);
+  return wrap;
+}
+async function setPrio(sid, v){ await post("/api/meta",{session_id:sid,priority:v}); refreshAll(); }
+async function toggleResolved(sid, cur){ await post("/api/meta",{session_id:sid,resolved:cur?0:1});
+  toast(cur?"reopened":"resolved"); refreshAll(); }
+function noteBox(sid, val){
+  const t=el("textarea",{class:"note"+(val?" show":""),placeholder:"note…"});
+  t.value=val||"";
+  t.addEventListener("change",()=>post("/api/meta",{session_id:sid,note:t.value}).then(()=>toast("note saved")));
+  return t;
+}
+
+// A dim "aka …" line listing names this session outgrew (its aiTitle changed). Auto-maintained, never in the editable note.
+function akaLine(s){
+  const p=(s.prev_titles||[]).filter(t=>t&&t!==s.title);
+  if(!p.length) return null;
+  return el("div",{class:"aka",title:"previous name"+(p.length>1?"s":"")+":\n"+p.join("\n")},
+    el("b",{text:"aka"}), " "+p.join(" · "));
+}
+// ---------- ACTIVE ----------
+function activeCard(s){
+  const waiting=s.status==="waiting";
+  const dotcls=["busy","idle","waiting"].includes(s.status)?s.status:"";
+  const dot=el("div",{class:"dot "+dotcls});
+  const sub=el("div",{class:"sub"},
+    el("span",{class:"badge proj",text:s.project}),
+    waiting?el("span",{class:"badge need",text:"✋ needs you"}):el("span",{text:s.status}),
+    liveAgoCell(s),
+    ...gitBadges(s.git),
+    s.git&&s.git.branch?el("span",{class:"badge mono",text:s.git.branch}):null,
+    el("span",{class:"mono",style:"color:var(--dim2)",text:s.cwd})
+  );
+  const note=noteBox(s.session_id, s.note);
+  const head=el("div",{class:"row"},
+    dot,
+    el("div",{style:"min-width:0;flex:1"},
+      el("div",{class:"title",text:s.title||s.name||"(session)"}),
+      akaLine(s),
+      sub
+    ),
+    prioSet(s.session_id, s.priority)
+  );
+  const acts=el("div",{class:"sub"},
+    copyBtn("⧉ resume cmd", resumeCmd(s)),
+    copyBtn("⧉ path", s.cwd),
+    el("button",{class:"ghost",text:"note",onclick:()=>note.classList.toggle("show")})
+  );
+  return el("div",{class:"card"+(waiting?" need":"")}, head, acts, note);
+}
+
+// ---------- HISTORY ----------
+function histCard(s){
+  const chk=el("button",{class:"chk"+(s.resolved?" on":""),title:s.resolved?"resolved — click to reopen":"open — click to resolve",
+    text:s.resolved?"●":"○",onclick:()=>toggleResolved(s.session_id,s.resolved)});
+  const badges=[el("span",{class:"badge proj",text:s.project})];
+  if(s.live) badges.push(el("span",{class:"badge live",text:"● live"}));
+  if(s.priority) badges.push(el("span",{class:"badge prio p"+s.priority,text:PRIO[s.priority]}));
+  gitBadges(s.git).forEach(b=>badges.push(b));
+  const sub=el("div",{class:"sub"}, ...badges,
+    agoCell(s),
+    el("span",{style:"color:var(--dim2)",text:s.msg_count+" msgs"})
+  );
+  const note=noteBox(s.session_id, s.note);
+  const head=el("div",{class:"row"},
+    chk,
+    el("div",{style:"min-width:0;flex:1"},
+      el("div",{class:"title",text:s.title||"(untitled)"}),
+      akaLine(s),
+      sub
+    ),
+    el("div",{class:"acts"},
+      prioSet(s.session_id, s.priority),
+      copyBtn("⧉", resumeCmd(s)),
+      pencilBtn(()=>note.classList.toggle("show"))
+    )
+  );
+  return el("div",{class:"card"}, head, note);
+}
+
+function renderTabs(counts){
+  const tabs=document.getElementById("tabs"); tabs.textContent="";
+  const defs=[["attention","Needs attention",counts.attention],["unresolved","Unresolved",counts.open],
+              ["resolved","Resolved",counts.resolved],["all","All",counts.all]];
+  for(const [key,label,n] of defs){
+    const t=el("div",{class:"tab"+(STATE.filter===key&&!STATE.searching?" on":""),onclick:()=>{STATE.filter=key;STATE.searching=false;document.getElementById("q").value="";loadHistory();}},
+      document.createTextNode(label), el("span",{class:"n",text:String(n??"")}));
+    tabs.append(t);
+  }
+}
+
+// priority filter pills (High/Medium/Low), single-select toggle; pick(null) clears.
+// No per-priority colour — same on/off pill look as every other filter, so "active" is obvious.
+function prioFilter(cur, pick){
+  const wrap=el("span",{class:"pfset"});
+  [[1,"High"],[2,"Medium"],[3,"Low"]].forEach(([v,lbl])=>
+    wrap.append(el("span",{class:"pf"+(cur===v?" on":""),
+      title:cur===v?"clear priority filter":"show only "+lbl+" priority",
+      onclick:()=>pick(cur===v?null:v)}, document.createTextNode(lbl))));
+  return wrap;
+}
+async function loadActive(){
+  const d=await api("/api/active");
+  const box=document.getElementById("active"); box.textContent="";
+  const f=STATE.activeFilter, p=STATE.activePrio;
+  const list=sortActive(d.active.filter(s=>(!f||s.status===f)&&(!p||s.priority===p)));
+  if(!list.length) box.append(el("div",{class:"empty",
+    text:f==="waiting"?"Nothing needs your input right now."
+        :(f||p)?"No matching live sessions.":"No live Claude sessions right now."}));
+  list.forEach(s=>box.append(activeCard(s)));
+  renderActiveStat(d.stats);
+  document.getElementById("activeprio").replaceChildren(
+    prioFilter(STATE.activePrio, v=>{STATE.activePrio=v; loadActive();}));
+  const live=document.getElementById("livestat"); live.textContent="";
+  live.append(document.createTextNode("● "),
+    el("b",{text:String(d.stats.active)}), document.createTextNode(" live sessions"));
+}
+// clickable status pills double as a filter for the Active list (waiting always shown, even at 0)
+function renderActiveStat(st){
+  const box=document.getElementById("activestat"); box.textContent="";
+  const chip=(f,n,label)=>el("span",
+    {class:"sf"+(STATE.activeFilter===f?" on":""),
+     title:STATE.activeFilter===f?"clear filter":"show only "+label,
+     onclick:()=>setActiveFilter(f)},
+    el("span",{class:"idot "+f}), document.createTextNode(n+" "+label));
+  box.append(chip("waiting",st.waiting,"needs you"),   // always present so its absence is meaningful too
+            chip("busy",st.busy,"busy"),
+            chip("idle",st.idle,"idle"));
+}
+function setActiveFilter(f){ STATE.activeFilter=STATE.activeFilter===f?null:f; loadActive(); }
+// Client-side sort of live sessions. "status" keeps the server order; every mode still floats waiting (needs-you) to the top.
+function sortActive(list){
+  const s=STATE.activeSort;
+  if(s==="status") return list;                 // server already orders waiting→busy→idle, then priority, then name
+  const t=x=>x.updated_at||x.status_since||x.last_activity||"";
+  const cmp = s==="recent" ? (x,y)=>t(y).localeCompare(t(x))          // most recently updated first
+            : s==="idle"   ? (x,y)=>t(x).localeCompare(t(y))          // longest since update first
+            : /* priority */ (x,y)=>(x.priority||1)-(y.priority||1) || t(y).localeCompare(t(x)) || (x.name||"").localeCompare(y.name||"");  // no priority sorts as High(1); ties → last update (recent first)
+  const waitingFirst=x=>x.status==="waiting"?0:1;   // needs-you stays impossible to miss regardless of sort
+  return [...list].sort((x,y)=> waitingFirst(x)-waitingFirst(y) || cmp(x,y));
+}
+async function loadHistory(){
+  renderTabsPlaceholder();
+  const d=await api(`/api/history?filter=${STATE.filter}&sort=${STATE.sort}&limit=500&active=${STATE.histActive?1:0}`);
+  renderTabs(d.counts);
+  document.getElementById("histprio").replaceChildren(
+    prioFilter(STATE.histPrio, v=>{STATE.histPrio=v; loadHistory();}));
+  const rows=STATE.histPrio?d.rows.filter(r=>r.priority===STATE.histPrio):d.rows;
+  STATE.lastFiltered=rows.map(r=>r.session_id);   // "resolve all shown" = the currently visible set
+  const box=document.getElementById("history"); box.textContent="";
+  if(!rows.length) box.append(el("div",{class:"empty",
+    text:STATE.histPrio?"No sessions at this priority.":"Nothing here — try another tab."}));
+  rows.forEach(s=>box.append(histCard(s)));
+  document.getElementById("histstat").textContent=`${rows.length} shown`;
+}
+function renderTabsPlaceholder(){ if(!document.getElementById("tabs").children.length) renderTabs({}); }
+
+async function runSearch(q){
+  STATE.searching=true;
+  const d=await api("/api/search?q="+encodeURIComponent(q));
+  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("on"));
+  document.getElementById("histprio").replaceChildren(
+    prioFilter(STATE.histPrio, v=>{STATE.histPrio=v; runSearch(document.getElementById("q").value.trim());}));
+  const rows=STATE.histPrio?d.rows.filter(r=>r.priority===STATE.histPrio):d.rows;
+  const box=document.getElementById("history"); box.textContent="";
+  document.getElementById("histstat").textContent=`${rows.length} matches`;
+  if(!rows.length) box.append(el("div",{class:"empty",text:"No matches."}));
+  rows.forEach(s=>box.append(histCard(s)));
+}
+
+function refreshAll(){ loadActive(); if(STATE.searching){ const q=document.getElementById("q").value.trim(); if(q) runSearch(q); else loadHistory(); } else loadHistory(); }
+
+// ---- events ----
+let qTimer;
+document.getElementById("q").addEventListener("input",e=>{
+  clearTimeout(qTimer); const q=e.target.value.trim();
+  qTimer=setTimeout(()=>{ if(q) runSearch(q); else {STATE.searching=false; loadHistory();} },180);
+});
+document.getElementById("sort").addEventListener("change",e=>{STATE.sort=e.target.value; loadHistory();});
+document.getElementById("activesort").addEventListener("change",e=>{STATE.activeSort=e.target.value; loadActive();});
+document.getElementById("rescan").addEventListener("click",async()=>{
+  toast("rescanning…"); const r=await post("/api/rescan",{}); toast(`indexed ${r.changed} changed`); refreshAll();});
+document.getElementById("help").addEventListener("click",helpDialog);
+const histActiveBtn=document.getElementById("histactive");
+histActiveBtn.classList.toggle("on",STATE.histActive);
+histActiveBtn.addEventListener("click",()=>{
+  STATE.histActive=!STATE.histActive; histActiveBtn.classList.toggle("on",STATE.histActive);
+  if(STATE.searching){ const q=document.getElementById("q").value.trim(); if(q){ runSearch(q); return; } }
+  loadHistory();
+});
+document.getElementById("bulk").addEventListener("click",async()=>{
+  const ids=STATE.lastFiltered; if(!ids.length){toast("nothing to resolve");return;}
+  const ok=await confirmDialog(`Mark ${ids.length} session${ids.length>1?"s":""} in this view as resolved?`,`Resolve ${ids.length}`);
+  if(!ok) return;
+  await post("/api/meta/bulk",{session_ids:ids,resolved:true}); toast(`resolved ${ids.length}`); refreshAll();});
+window.addEventListener("keydown",e=>{
+  if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="k"){e.preventDefault();document.getElementById("q").focus();}
+  if(e.key==="Escape"&&document.activeElement===document.getElementById("q")){
+    document.getElementById("q").value="";STATE.searching=false;loadHistory();document.getElementById("q").blur();}
+});
+
+// ---- boot ----
+loadActive(); loadHistory();
+setInterval(loadActive, 10000);
+</script>
+</body>
+</html>

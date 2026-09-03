@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Claude Session Board</title>
+<title>Agent Session Board</title>
 <style>
   :root{
     /* neutral scale (Radix slate dark) — bulk of the UI, high-contrast + readable */
@@ -94,6 +94,8 @@
   .badge.push{color:var(--push);border-color:#c99a3f3d;background:transparent}
   /* live is reassuring, not urgent — muted green outline */
   .badge.live{color:var(--ok);border-color:#4cc38a3d;background:transparent}
+  /* agent source — only shown for non-Claude (Kiro); violet so it reads as a "which tool" tag, not a signal */
+  .badge.kiro{color:#c9b3ff;border-color:#8b5cf659;background:#8b5cf61f;font-weight:600}
   .badge.prio{font-weight:600}
   /* High shouts (red fill); Medium is a mild gold; Low is plain gray */
   .p1{color:#ff9ea3!important;border-color:#e5555b66!important;background:#e5555b26!important}
@@ -135,7 +137,7 @@
 </head>
 <body>
 <header>
-  <h1><span class="k">◧</span> Claude Session Board</h1>
+  <h1><span class="k">◧</span> Agent Session Board</h1>
   <span class="stat" id="livestat">…</span>
   <label class="search">
     <svg class="si" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
@@ -230,12 +232,13 @@ function confirmDialog(msg, yesLabel="Yes"){
 }
 // The board's non-obvious, baked-in behaviours — surfaced so they aren't a mystery.
 const HELP_SECTIONS=[
-  ["Refreshing", el("p",{},"The Active list polls every 10s. Each poll re-reads live sessions' transcripts, so a new or renamed session shows its real Claude Code title within a refresh (throttled to ~20s per session, since a busy transcript can be 100+ MB). ", el("code",{text:"↻ rescan"}), " does a full re-index of all history.")],
-  ["Titles & “aka”", el("p",{},"A card shows the session's current title. Claude Code regenerates that title as the topic shifts — when it changes, the previous name is kept as the italic ", el("i",{text:"aka"})," line under the title, and stays searchable.")],
+  ["Refreshing", el("p",{},"The Active list polls every 10s. Each poll re-reads live sessions' transcripts, so a new or renamed session shows its real title within a refresh (throttled to ~20s per session, since a busy transcript can be 100+ MB). ", el("code",{text:"↻ rescan"}), " does a full re-index of all history.")],
+  ["Sources", el("p",{},"The board tracks both Claude Code and Kiro-cli sessions. Kiro sessions carry a violet ", el("span",{class:"badge kiro",text:"kiro"})," tag; Claude is the unmarked default. Kiro exposes no busy/waiting state, so a live Kiro session shows as ", el("i",{text:"idle"}),". The resume-command button gives the right command for each (", el("code",{text:"claude --resume"})," vs ", el("code",{text:"kiro-cli chat --resume-id"}),").")],
+  ["Titles & “aka”", el("p",{},"A card shows the session's current title. Claude Code regenerates that title as the topic shifts — when it changes, the previous name is kept as the italic ", el("i",{text:"aka"})," line under the title, and stays searchable. (Kiro sessions keep a single title, so no ", el("i",{text:"aka"}),".)")],
   ["Sorting", el("p",{},"Every sort except ", el("i",{text:"last update"})," breaks ties by last update, most-recent first. In the Active list, a session with ", el("b",{style:"display:inline",text:"no priority set sorts the same as High"}),"  — an untriaged live session is treated as important until you say otherwise.")],
   ["Priority", el("p",{},"①High ②Medium ③Low, set by hand on each card; blank counts as High for sorting only. Priorities you set are never changed by triage.")],
   ["Triage (open vs resolved)", el("p",{},"Open/resolved is decided by read-only AI judges reading a sanitized digest of each session. Transcript text is treated as untrusted data (guards against prompt injection), the pass is non-destructive, and your manual notes and priorities are preserved. When unsure it leaves a session open.")],
-  ["Defaults", el("p",{},"Active sorts by priority; History sorts by last message and ", el("b",{style:"display:inline",text:"hides currently-live sessions by default"}),' — they\'re already in the Active column, so flip "include active" to also list them here. Everything stays on ', el("code",{text:"127.0.0.1"})," and never writes into ", el("code",{text:"~/.claude"}),".")],
+  ["Defaults", el("p",{},"Active sorts by priority; History sorts by last message and ", el("b",{style:"display:inline",text:"hides currently-live sessions by default"}),' — they\'re already in the Active column, so flip "include active" to also list them here. Everything stays on ', el("code",{text:"127.0.0.1"})," and never writes into ", el("code",{text:"~/.claude"})," or ", el("code",{text:"~/.kiro"}),".")],
 ];
 function helpDialog(){
   const close=()=>{ document.removeEventListener("keydown",onKey); ov.classList.remove("show"); setTimeout(()=>ov.remove(),120); };
@@ -291,6 +294,8 @@ function liveAgoCell(s){
   if(lines.length) sp.title=lines.join("\n");
   return sp;
 }
+// Which agent produced the session. Claude is the implicit default (no badge); tag only the newcomers.
+function sourceBadge(s){ return s.source==="kiro" ? el("span",{class:"badge kiro",text:"kiro"}) : null; }
 function gitBadges(g){
   const out=[];
   if(!g||!g.is_repo) return out;
@@ -305,7 +310,9 @@ function copyBtn(label, text){
 const PRIO={1:"High",2:"Medium",3:"Low"};
 const shq=s=>"'"+String(s).replace(/'/g,"'\\''")+"'";  // single-quote for the shell (handles spaces)
 function resumeCmd(s){
-  const r="claude --resume "+s.session_id;
+  const r = s.source==="kiro"
+    ? "kiro-cli chat --resume-id "+s.session_id   // Kiro resumes a specific session by id
+    : "claude --resume "+s.session_id;
   return s.cwd ? "cd "+shq(s.cwd)+" && "+r : r;
 }
 // pencil glyph (top-right eraser → bottom-left tip). Trusted constant string, no user data → innerHTML is safe.
@@ -346,6 +353,7 @@ function activeCard(s){
   const dot=el("div",{class:"dot "+dotcls});
   const sub=el("div",{class:"sub"},
     el("span",{class:"badge proj",text:s.project}),
+    sourceBadge(s),
     waiting?el("span",{class:"badge need",text:"✋ needs you"}):el("span",{text:s.status}),
     liveAgoCell(s),
     ...gitBadges(s.git),
@@ -375,6 +383,7 @@ function histCard(s){
   const chk=el("button",{class:"chk"+(s.resolved?" on":""),title:s.resolved?"resolved — click to reopen":"open — click to resolve",
     text:s.resolved?"●":"○",onclick:()=>toggleResolved(s.session_id,s.resolved)});
   const badges=[el("span",{class:"badge proj",text:s.project})];
+  const sb=sourceBadge(s); if(sb) badges.push(sb);
   if(s.live) badges.push(el("span",{class:"badge live",text:"● live"}));
   if(s.priority) badges.push(el("span",{class:"badge prio p"+s.priority,text:PRIO[s.priority]}));
   gitBadges(s.git).forEach(b=>badges.push(b));
@@ -427,7 +436,7 @@ async function loadActive(){
   const list=sortActive(d.active.filter(s=>(!f||s.status===f)&&(!p||s.priority===p)));
   if(!list.length) box.append(el("div",{class:"empty",
     text:f==="waiting"?"Nothing needs your input right now."
-        :(f||p)?"No matching live sessions.":"No live Claude sessions right now."}));
+        :(f||p)?"No matching live sessions.":"No live sessions right now."}));
   list.forEach(s=>box.append(activeCard(s)));
   renderActiveStat(d.stats);
   document.getElementById("activeprio").replaceChildren(

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Claude Session Board — a localhost dashboard to triage active + past Claude Code sessions.
+"""Agent Session Board — a localhost dashboard to triage active + past AI coding-agent sessions.
 
-Read-only over ~/.claude. Your own metadata (priority / resolved / note) lives in a
-separate SQLite DB and is NEVER written back into ~/.claude.
+Covers Claude Code (~/.claude) and Kiro-cli (~/.kiro), read-only. Your own metadata
+(priority / resolved / note) lives in a separate SQLite DB and is NEVER written back into either.
 
 Run:   python3 ~/bin/session-board/server.py         # index + serve on 127.0.0.1:8787
        python3 ~/bin/session-board/server.py --reindex   # full reindex, print stats, exit
@@ -15,6 +15,7 @@ HOME     = os.path.expanduser("~")
 CLAUDE   = os.path.join(HOME, ".claude")
 PROJECTS = os.path.join(CLAUDE, "projects")
 SESSIONS = os.path.join(CLAUDE, "sessions")
+KIRO_DIR = os.path.join(HOME, ".kiro", "sessions", "cli")   # Kiro-cli sessions: <sid>.json (meta) + <sid>.jsonl (transcript) + <sid>.lock (live)
 DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
                         "claude-session-board")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -179,6 +180,99 @@ def parse_session(path):
         started=started, last=last, last_msg=last_msg, msg_count=msg_count, user_msgs=user_msgs,
         version=version or "", last_prompt=clean(last_prompt or first_user or "", 220),
         content=clean(" ".join(content_parts), CONTENT_CAP),
+        source="claude",
+    )
+
+
+# ---------------------------------------------------------------- Kiro-cli parsing
+# Kiro stores each session as <sid>.json (metadata sidecar) + <sid>.jsonl (transcript of
+# {version,kind,data} records; kind ∈ Prompt / AssistantMessage / ToolResults). The sidecar
+# already carries the descriptive title, cwd and created/updated times, so most fields come
+# from there; the .jsonl is walked only for message counts + searchable content.
+def _kiro_text(content):
+    """Join the plain-text blocks of a Kiro message's content list (skip thinking/tool/image)."""
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for b in content:
+        if isinstance(b, dict) and b.get("kind") == "text" and isinstance(b.get("data"), str) and b["data"]:
+            parts.append(b["data"])
+    return " ".join(parts)
+
+
+def _kiro_mtime(json_path):
+    """Freshness of a Kiro session = newest mtime of its .json sidecar and .jsonl transcript."""
+    m = 0.0
+    for p in (json_path, os.path.splitext(json_path)[0] + ".jsonl"):
+        try:
+            m = max(m, os.path.getmtime(p))
+        except OSError:
+            pass
+    return m
+
+
+def parse_kiro_session(json_path):
+    """Parse one Kiro-cli session (.json sidecar + sibling .jsonl) into the same dict shape as
+    parse_session, tagged source='kiro'. Returns None for an empty session (no title, no messages)."""
+    try:
+        meta = json.load(open(json_path))
+    except Exception:
+        return None
+    sid = meta.get("session_id") or os.path.splitext(os.path.basename(json_path))[0]
+    cwd = meta.get("cwd") or ""
+    title = clean(meta.get("title") or "", 180)
+    jsonl = os.path.splitext(json_path)[0] + ".jsonl"
+    msg_count = user_msgs = 0
+    first_user = last_user = None
+    content_parts, content_len = [], 0
+    try:
+        with open(jsonl, "r", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                kind = o.get("kind")
+                data = o.get("data") if isinstance(o.get("data"), dict) else {}
+                if kind == "Prompt":
+                    txt = _kiro_text(data.get("content"))
+                    if txt:
+                        msg_count += 1
+                        user_msgs += 1
+                        if first_user is None:
+                            first_user = txt
+                        last_user = txt
+                        if content_len < CONTENT_CAP:
+                            content_parts.append(txt); content_len += len(txt)
+                elif kind == "AssistantMessage":
+                    msg_count += 1
+                    if content_len < CONTENT_CAP:
+                        atxt = _kiro_text(data.get("content"))
+                        if atxt:
+                            content_parts.append(atxt); content_len += len(atxt)
+    except OSError:
+        pass
+    if not title and msg_count == 0:
+        return None  # freshly-created / empty session — nothing to show
+    if title:
+        src = "ai"
+    elif first_user:
+        title, src = clean(first_user, 180), "prompt"
+    else:
+        title, src = "(untitled)", "none"
+    started = meta.get("created_at")
+    last = meta.get("updated_at") or started
+    return dict(
+        session_id=sid, cwd=cwd, branch="",
+        title=title, title_source=src, prev_titles=[],
+        started=started, last=last, last_msg=last,
+        msg_count=msg_count, user_msgs=user_msgs,
+        version="", last_prompt=clean(last_user or first_user or "", 220),
+        content=clean(" ".join(content_parts), CONTENT_CAP),
+        source="kiro",
     )
 
 
@@ -196,7 +290,7 @@ def init_db(c):
       session_id TEXT UNIQUE, project TEXT, cwd TEXT, title TEXT, title_source TEXT,
       git_branch TEXT, started_at TEXT, last_activity TEXT, last_msg TEXT,
       msg_count INTEGER, user_msgs INTEGER, version TEXT,
-      last_prompt TEXT, file_path TEXT, file_mtime REAL
+      last_prompt TEXT, file_path TEXT, file_mtime REAL, source TEXT DEFAULT 'claude'
     );
     CREATE TABLE IF NOT EXISTS meta(
       session_id TEXT PRIMARY KEY, priority INTEGER, resolved INTEGER DEFAULT 0,
@@ -213,7 +307,7 @@ def init_db(c):
     );
     """)
     # migrate older DBs that predate a column (ADD COLUMN is a no-op error if it exists)
-    for col, decl in (("last_msg", "TEXT"), ("prev_titles", "TEXT")):
+    for col, decl in (("last_msg", "TEXT"), ("prev_titles", "TEXT"), ("source", "TEXT DEFAULT 'claude'")):
         try:
             c.execute("ALTER TABLE session ADD COLUMN %s %s" % (col, decl))
         except Exception:
@@ -253,17 +347,19 @@ def _upsert_session(c, s, path, mt):
     prev_titles_json = json.dumps(s["prev_titles"], ensure_ascii=False) if s.get("prev_titles") else None
     c.execute("""INSERT INTO session
       (session_id,project,cwd,title,title_source,prev_titles,git_branch,started_at,last_activity,last_msg,
-       msg_count,user_msgs,version,last_prompt,file_path,file_mtime)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       msg_count,user_msgs,version,last_prompt,file_path,file_mtime,source)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(session_id) DO UPDATE SET
        project=excluded.project,cwd=excluded.cwd,title=excluded.title,title_source=excluded.title_source,
        prev_titles=excluded.prev_titles,
        git_branch=excluded.git_branch,started_at=excluded.started_at,last_activity=excluded.last_activity,
        last_msg=excluded.last_msg,
        msg_count=excluded.msg_count,user_msgs=excluded.user_msgs,version=excluded.version,
-       last_prompt=excluded.last_prompt,file_path=excluded.file_path,file_mtime=excluded.file_mtime""",
+       last_prompt=excluded.last_prompt,file_path=excluded.file_path,file_mtime=excluded.file_mtime,
+       source=excluded.source""",
       (s["session_id"], project_name(s["cwd"]), s["cwd"], s["title"], s["title_source"], prev_titles_json, s["branch"],
-       s["started"], s["last"], s["last_msg"], s["msg_count"], s["user_msgs"], s["version"], s["last_prompt"], path, mt))
+       s["started"], s["last"], s["last_msg"], s["msg_count"], s["user_msgs"], s["version"], s["last_prompt"], path, mt,
+       s.get("source", "claude")))
     c.execute("INSERT INTO session_content(session_id,content) VALUES(?,?) "
               "ON CONFLICT(session_id) DO UPDATE SET content=excluded.content",
               (s["session_id"], s["content"]))
@@ -286,14 +382,18 @@ def _refresh_live(c, live):
         sid = d.get("sessionId")
         if not sid:
             continue
+        kiro = d.get("source") == "kiro"
         path = known[sid][0] if (sid in known and known[sid][0]) else None
-        if not path:  # brand-new session never indexed — locate its transcript
-            hits = glob.glob(os.path.join(PROJECTS, "**", sid + ".jsonl"), recursive=True)
-            path = hits[0] if hits else None
+        if not path:  # brand-new session never indexed — locate its transcript/sidecar
+            if kiro:
+                path = os.path.join(KIRO_DIR, sid + ".json")
+            else:
+                hits = glob.glob(os.path.join(PROJECTS, "**", sid + ".jsonl"), recursive=True)
+                path = hits[0] if hits else None
         if not path or not os.path.exists(path):
             continue
         try:
-            mt = os.path.getmtime(path)
+            mt = _kiro_mtime(path) if kiro else os.path.getmtime(path)
         except OSError:
             continue
         if sid in known and known[sid][1] == mt:
@@ -304,10 +404,10 @@ def _refresh_live(c, live):
             if now - _LIVE_PARSE_AT.get(sid, 0) < LIVE_REFRESH_MIN_S:
                 continue                       # parsed recently; skip (mtime stays stale → caught next window)
             _LIVE_PARSE_AT[sid] = now          # claim the slot before the slow parse so concurrent polls skip
-        if is_sidechain_file(path):
+        if not kiro and is_sidechain_file(path):
             continue
-        s = parse_session(path)
-        if s["session_id"]:
+        s = parse_kiro_session(path) if kiro else parse_session(path)
+        if s and s["session_id"]:
             _upsert_session(c, s, path, mt)
             changed = True
     if changed:
@@ -334,6 +434,18 @@ def reindex(c, full=False):
             continue
         _upsert_session(c, s, path, mt)
         changed += 1
+    # Kiro-cli sessions live in a flat dir as <sid>.json sidecars; freshness = newest of .json/.jsonl
+    kiro_files = glob.glob(os.path.join(KIRO_DIR, "*.json"))
+    for jp in kiro_files:
+        mt = _kiro_mtime(jp)
+        if not full and known.get(jp) == mt:
+            continue
+        s = parse_kiro_session(jp)
+        if not s or not s["session_id"]:
+            continue
+        _upsert_session(c, s, jp, mt)
+        changed += 1
+    files = files + kiro_files
     if changed or full:
         c.execute("DELETE FROM session_fts")
         c.execute("INSERT INTO session_fts(rowid,title,last_prompt,project,content) "
@@ -393,6 +505,43 @@ def proc_alive(pid):
         return False, None
 
 
+def _kiro_proc_alive(pid):
+    """A Kiro lock is live iff its pid is running AND is a kiro process (guards PID reuse)."""
+    try:
+        with open("/proc/%d/cmdline" % int(pid), "rb") as fh:
+            cmd = fh.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+    except Exception:
+        return False
+    return "kiro" in cmd.lower()
+
+
+def read_kiro_live():
+    """Live Kiro sessions = those with a <sid>.lock whose pid is a running kiro process.
+    Kiro exposes no busy/waiting signal, so status is reported as a neutral 'idle'."""
+    out = []
+    for lock in glob.glob(os.path.join(KIRO_DIR, "*.lock")):
+        try:
+            info = json.load(open(lock))
+        except Exception:
+            continue
+        pid = info.get("pid")
+        if not pid or not _kiro_proc_alive(pid):
+            continue
+        jp = os.path.splitext(lock)[0] + ".json"
+        try:
+            meta = json.load(open(jp))
+        except Exception:
+            continue
+        sid = meta.get("session_id") or os.path.splitext(os.path.basename(jp))[0]
+        upd_ms = int((epoch_utc(meta.get("updated_at")) or 0) * 1000)
+        out.append(dict(
+            sessionId=sid, name=clean(meta.get("title") or "", 60),
+            cwd=meta.get("cwd") or "", status="idle", pid=pid,
+            updatedAt=upd_ms, statusUpdatedAt=upd_ms, source="kiro",
+        ))
+    return out
+
+
 def read_live():
     live = []
     for f in glob.glob(os.path.join(SESSIONS, "*.json")):
@@ -408,7 +557,9 @@ def read_live():
             continue
         if d.get("procStart") and pstart and str(d["procStart"]) != str(pstart):
             continue  # PID was reused by another process
+        d.setdefault("source", "claude")
         live.append(d)
+    live += read_kiro_live()
     return live
 
 
@@ -441,6 +592,7 @@ def build_active(c):
         m = mm.get(sid, {})
         out.append(dict(
             session_id=sid,
+            source=d.get("source", "claude"),
             name=clean(d.get("name") or "", 60),
             title=(row["title"] if row else clean(d.get("name") or "", 120)),
             prev_titles=(_prev_titles(row) if row else []),
@@ -484,7 +636,8 @@ def _prev_titles(r):
 
 def _row_dict(r, m, git):
     return dict(
-        session_id=r["session_id"], title=r["title"], title_source=r["title_source"],
+        session_id=r["session_id"], source=(r["source"] if "source" in r.keys() else "claude"),
+        title=r["title"], title_source=r["title_source"],
         prev_titles=_prev_titles(r),
         project=r["project"], cwd=r["cwd"], branch=r["git_branch"],
         started_at=r["started_at"], last_activity=r["last_activity"], last_msg=r["last_msg"],
@@ -722,7 +875,7 @@ def main():
     c.close()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     url = "http://127.0.0.1:%d/" % PORT
-    print("\n  Claude Session Board")
+    print("\n  Agent Session Board")
     print("  %s" % url)
     print("  (localhost only, token-guarded; Ctrl-C to stop)\n")
     try:

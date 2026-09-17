@@ -515,8 +515,15 @@ def _kiro_proc_alive(pid):
     return "kiro" in cmd.lower()
 
 
+KIRO_LIVE_MAX_IDLE_S = 8 * 3600  # a Kiro chat's .lock lingers while its terminal stays open;
+                                 # treat it as "active" only if the transcript changed this recently
+
+
 def read_kiro_live():
-    """Live Kiro sessions = those with a <sid>.lock whose pid is a running kiro process.
+    """Live Kiro sessions = those with a <sid>.lock whose pid is a running kiro process AND
+    whose transcript changed within KIRO_LIVE_MAX_IDLE_S. Kiro has no idle/busy heartbeat and
+    its lock outlives real activity (it survives as long as the chat terminal is open), so the
+    process-alive check alone flags long-idle sessions as active; the recency gate fixes that.
     Kiro exposes no busy/waiting signal, so status is reported as a neutral 'idle'."""
     out = []
     for lock in glob.glob(os.path.join(KIRO_DIR, "*.lock")):
@@ -528,6 +535,8 @@ def read_kiro_live():
         if not pid or not _kiro_proc_alive(pid):
             continue
         jp = os.path.splitext(lock)[0] + ".json"
+        if time.time() - _kiro_mtime(jp) > KIRO_LIVE_MAX_IDLE_S:
+            continue  # process alive but chat untouched for hours -> not "active"
         try:
             meta = json.load(open(jp))
         except Exception:
